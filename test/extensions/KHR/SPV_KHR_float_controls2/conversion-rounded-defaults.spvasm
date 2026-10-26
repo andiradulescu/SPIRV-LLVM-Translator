@@ -1,0 +1,113 @@
+; REQUIRES: spirv-as
+; RUN: spirv-as %s -o %t.spv
+; RUN: spirv-val %t.spv
+; RUN: llvm-spirv -r --spirv-target-env=SPV-IR %t.spv -o %t.bc
+; RUN: llvm-dis %t.bc -o - | FileCheck %s --check-prefix=LLVM
+; RUN: llvm-spirv -r %t.spv -o %t.ocl.bc
+; RUN: llvm-dis %t.ocl.bc -o - | FileCheck %s --check-prefix=LLVM
+; RUN: llvm-spirv %t.ocl.bc --spirv-ext=+SPV_KHR_float_controls2 -o %t.back.spv
+; RUN: spirv-val %t.back.spv
+; RUN: llvm-spirv %t.ocl.bc --spirv-ext=+SPV_KHR_float_controls2 -spirv-text -o - | FileCheck %s --check-prefix=SPIRV
+; RUN: llvm-spirv -r %t.back.spv -o %t.back.bc
+; RUN: llvm-dis %t.back.bc -o - | FileCheck %s --check-prefix=LLVM
+
+; Rounded conversions become calls, but must retain the same permissions as
+; native casts. Both callers grant contract, through different type defaults.
+; LLVM-LABEL: define internal spir_func void @permissive(
+; LLVM: call contract spir_func half @{{.*}}(float
+; A helper reached from a kernel without defaults remains strict.
+; LLVM-LABEL: define internal spir_func void @shared(
+; LLVM: call spir_func half @{{.*}}(float
+; Explicit permissions replace defaults, including an explicit zero.
+; LLVM-LABEL: define spir_kernel void @override(
+; LLVM: call contract spir_func half @{{.*}}(float
+; LLVM: call spir_func half @{{.*}}(float
+; SPIRV-DAG: EntryPoint 6 [[HALF_KERNEL:[0-9]+]] "half_default"
+; SPIRV-DAG: EntryPoint 6 [[FLOAT_KERNEL:[0-9]+]] "float_default"
+; SPIRV-DAG: TypeFloat [[HALF:[0-9]+]] 16
+; SPIRV-DAG: TypeFloat [[FLOAT:[0-9]+]] 32
+; SPIRV-DAG: Constant {{[0-9]+}} [[ALLOW:[0-9]+]] 65536
+; SPIRV-DAG: ExecutionModeId [[HALF_KERNEL]] 6028 [[HALF]] [[ALLOW]]
+; SPIRV-DAG: ExecutionModeId [[FLOAT_KERNEL]] 6028 [[FLOAT]] [[ALLOW]]
+
+OpCapability Addresses
+OpCapability Kernel
+OpCapability Float16Buffer
+OpCapability FloatControls2
+OpExtension "SPV_KHR_float_controls2"
+OpMemoryModel Physical64 OpenCL
+OpEntryPoint Kernel %half_default "half_default"
+OpEntryPoint Kernel %float_default "float_default"
+OpEntryPoint Kernel %override "override"
+OpEntryPoint Kernel %strict "strict"
+OpExecutionModeId %half_default FPFastMathDefault %half %contract
+OpExecutionModeId %float_default FPFastMathDefault %float %contract
+OpExecutionModeId %override FPFastMathDefault %half %nnan_contract
+OpName %permissive "permissive"
+OpName %shared "shared"
+OpName %half_default "half_default"
+OpName %float_default "float_default"
+OpName %override "override"
+OpName %strict "strict"
+OpDecorate %permissive_h FPRoundingMode RTE
+OpDecorate %shared_h FPRoundingMode RTE
+OpDecorate %allowed FPRoundingMode RTE
+OpDecorate %allowed FPFastMathMode AllowContract
+OpDecorate %denied FPRoundingMode RTE
+OpDecorate %denied FPFastMathMode None
+%void = OpTypeVoid
+%uint = OpTypeInt 32 0
+%half = OpTypeFloat 16
+%float = OpTypeFloat 32
+%contract = OpConstant %uint 65536
+%nnan_contract = OpConstant %uint 65537
+%ptr = OpTypePointer CrossWorkgroup %half
+%fn = OpTypeFunction %void %float %ptr
+%permissive = OpFunction %void None %fn
+%permissive_x = OpFunctionParameter %float
+%permissive_out = OpFunctionParameter %ptr
+%permissive_entry = OpLabel
+%permissive_h = OpFConvert %half %permissive_x
+OpStore %permissive_out %permissive_h
+OpReturn
+OpFunctionEnd
+%shared = OpFunction %void None %fn
+%shared_x = OpFunctionParameter %float
+%shared_out = OpFunctionParameter %ptr
+%shared_entry = OpLabel
+%shared_h = OpFConvert %half %shared_x
+OpStore %shared_out %shared_h
+OpReturn
+OpFunctionEnd
+%half_default = OpFunction %void None %fn
+%half_x = OpFunctionParameter %float
+%half_out = OpFunctionParameter %ptr
+%half_entry = OpLabel
+%half_call = OpFunctionCall %void %permissive %half_x %half_out
+OpReturn
+OpFunctionEnd
+%float_default = OpFunction %void None %fn
+%float_x = OpFunctionParameter %float
+%float_out = OpFunctionParameter %ptr
+%float_entry = OpLabel
+%float_call = OpFunctionCall %void %permissive %float_x %float_out
+OpReturn
+OpFunctionEnd
+%override = OpFunction %void None %fn
+%override_x = OpFunctionParameter %float
+%override_out = OpFunctionParameter %ptr
+%override_entry = OpLabel
+%allowed = OpFConvert %half %override_x
+OpStore %override_out %allowed
+%denied = OpFConvert %half %override_x
+OpStore %override_out %denied
+%shared_call = OpFunctionCall %void %shared %override_x %override_out
+OpReturn
+OpFunctionEnd
+%strict = OpFunction %void None %fn
+%strict_x = OpFunctionParameter %float
+%strict_out = OpFunctionParameter %ptr
+%strict_entry = OpLabel
+%strict_call = OpFunctionCall %void %shared %strict_x %strict_out
+OpReturn
+OpFunctionEnd

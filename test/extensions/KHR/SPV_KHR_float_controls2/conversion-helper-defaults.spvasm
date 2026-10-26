@@ -1,0 +1,145 @@
+; REQUIRES: spirv-as
+; RUN: spirv-as %s -o %t.spv
+; RUN: spirv-val %t.spv
+; RUN: llvm-spirv -r --spirv-target-env=SPV-IR %t.spv -o %t.bc
+; RUN: llvm-dis %t.bc -o - | FileCheck %s --check-prefix=LLVM
+; RUN: llvm-spirv %t.bc --spirv-ext=+SPV_KHR_float_controls2 -o %t.back.spv
+; RUN: spirv-val %t.back.spv
+; RUN: llvm-spirv %t.bc --spirv-ext=+SPV_KHR_float_controls2 -spirv-text -o - | FileCheck %s --check-prefix=SPIRV
+; RUN: llvm-spirv -r --spirv-target-env=SPV-IR %t.back.spv -o %t.back.bc
+; RUN: llvm-dis %t.back.bc -o - | FileCheck %s --check-prefix=LLVM
+
+; The helpers precede their callers, and one is reached through a wrapper.
+; Each caller permits contraction via a different type's default. Combine
+; operand/result defaults before intersecting permissions across callers.
+; LLVM-LABEL: define internal spir_func void @permissive(
+; LLVM: fptrunc contract float
+; LLVM: fpext contract half
+; A caller without defaults must not inherit another caller's permissions.
+; LLVM-LABEL: define internal spir_func void @shared(
+; LLVM: fptrunc float
+; LLVM: fpext half
+; Exported helpers and their callees can have unknown callers.
+; LLVM-LABEL: define internal spir_func void @exported_cast(
+; LLVM: fptrunc float
+; LLVM: fpext half
+; SPIRV-DAG: EntryPoint 6 [[HALF_KERNEL:[0-9]+]] "half_default"
+; SPIRV-DAG: EntryPoint 6 [[FLOAT_KERNEL:[0-9]+]] "float_default"
+; SPIRV-DAG: TypeFloat [[HALF:[0-9]+]] 16
+; SPIRV-DAG: TypeFloat [[FLOAT:[0-9]+]] 32
+; SPIRV-DAG: Constant {{[0-9]+}} [[ALLOW:[0-9]+]] 65536
+; SPIRV-DAG: ExecutionModeId [[HALF_KERNEL]] 6028 [[HALF]] [[ALLOW]]
+; SPIRV-DAG: ExecutionModeId [[FLOAT_KERNEL]] 6028 [[FLOAT]] [[ALLOW]]
+
+OpCapability Linkage
+OpCapability Addresses
+OpCapability Kernel
+OpCapability Float16Buffer
+OpCapability FloatControls2
+OpExtension "SPV_KHR_float_controls2"
+OpMemoryModel Physical64 OpenCL
+OpEntryPoint Kernel %half_default "half_default"
+OpEntryPoint Kernel %float_default "float_default"
+OpEntryPoint Kernel %allow_shared "allow_shared"
+OpEntryPoint Kernel %deny_shared "deny_shared"
+OpEntryPoint Kernel %allow_exported "allow_exported"
+OpExecutionModeId %half_default FPFastMathDefault %half %contract
+OpExecutionModeId %float_default FPFastMathDefault %float %contract
+OpExecutionModeId %allow_shared FPFastMathDefault %half %contract
+OpExecutionModeId %allow_shared FPFastMathDefault %float %contract
+OpExecutionModeId %allow_exported FPFastMathDefault %half %contract
+OpExecutionModeId %allow_exported FPFastMathDefault %float %contract
+OpName %half_default "half_default"
+OpName %float_default "float_default"
+OpName %allow_shared "allow_shared"
+OpName %deny_shared "deny_shared"
+OpName %permissive "permissive"
+OpName %shared "shared"
+OpName %wrapper "wrapper"
+OpName %allow_exported "allow_exported"
+OpName %exported_wrapper "exported_wrapper"
+OpName %exported_cast "exported_cast"
+OpDecorate %exported_wrapper LinkageAttributes "exported_wrapper" Export
+%void = OpTypeVoid
+%uint = OpTypeInt 32 0
+%half = OpTypeFloat 16
+%float = OpTypeFloat 32
+%contract = OpConstant %uint 65536
+%ptr = OpTypePointer CrossWorkgroup %float
+%fn = OpTypeFunction %void %float %ptr
+%permissive = OpFunction %void None %fn
+%permissive_x = OpFunctionParameter %float
+%permissive_out = OpFunctionParameter %ptr
+%permissive_entry = OpLabel
+%permissive_h = OpFConvert %half %permissive_x
+%permissive_f = OpFConvert %float %permissive_h
+OpStore %permissive_out %permissive_f
+OpReturn
+OpFunctionEnd
+%shared = OpFunction %void None %fn
+%shared_x = OpFunctionParameter %float
+%shared_out = OpFunctionParameter %ptr
+%shared_entry = OpLabel
+%shared_h = OpFConvert %half %shared_x
+%shared_f = OpFConvert %float %shared_h
+OpStore %shared_out %shared_f
+OpReturn
+OpFunctionEnd
+%wrapper = OpFunction %void None %fn
+%wrapper_x = OpFunctionParameter %float
+%wrapper_out = OpFunctionParameter %ptr
+%wrapper_entry = OpLabel
+%wrapper_call = OpFunctionCall %void %permissive %wrapper_x %wrapper_out
+OpReturn
+OpFunctionEnd
+%half_default = OpFunction %void None %fn
+%half_default_x = OpFunctionParameter %float
+%half_default_out = OpFunctionParameter %ptr
+%half_default_entry = OpLabel
+%half_default_call = OpFunctionCall %void %wrapper %half_default_x %half_default_out
+OpReturn
+OpFunctionEnd
+%float_default = OpFunction %void None %fn
+%float_default_x = OpFunctionParameter %float
+%float_default_out = OpFunctionParameter %ptr
+%float_default_entry = OpLabel
+%float_default_call = OpFunctionCall %void %permissive %float_default_x %float_default_out
+OpReturn
+OpFunctionEnd
+%allow_shared = OpFunction %void None %fn
+%allow_shared_x = OpFunctionParameter %float
+%allow_shared_out = OpFunctionParameter %ptr
+%allow_shared_entry = OpLabel
+%allow_shared_call = OpFunctionCall %void %shared %allow_shared_x %allow_shared_out
+OpReturn
+OpFunctionEnd
+%deny_shared = OpFunction %void None %fn
+%deny_shared_x = OpFunctionParameter %float
+%deny_shared_out = OpFunctionParameter %ptr
+%deny_shared_entry = OpLabel
+%deny_shared_call = OpFunctionCall %void %shared %deny_shared_x %deny_shared_out
+OpReturn
+OpFunctionEnd
+%exported_cast = OpFunction %void None %fn
+%exported_x = OpFunctionParameter %float
+%exported_out = OpFunctionParameter %ptr
+%exported_entry = OpLabel
+%exported_h = OpFConvert %half %exported_x
+%exported_f = OpFConvert %float %exported_h
+OpStore %exported_out %exported_f
+OpReturn
+OpFunctionEnd
+%exported_wrapper = OpFunction %void None %fn
+%exported_wrapper_x = OpFunctionParameter %float
+%exported_wrapper_out = OpFunctionParameter %ptr
+%exported_wrapper_entry = OpLabel
+%exported_wrapper_call = OpFunctionCall %void %exported_cast %exported_wrapper_x %exported_wrapper_out
+OpReturn
+OpFunctionEnd
+%allow_exported = OpFunction %void None %fn
+%allow_exported_x = OpFunctionParameter %float
+%allow_exported_out = OpFunctionParameter %ptr
+%allow_exported_entry = OpLabel
+%allow_exported_call = OpFunctionCall %void %exported_wrapper %allow_exported_x %allow_exported_out
+OpReturn
+OpFunctionEnd

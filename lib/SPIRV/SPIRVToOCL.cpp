@@ -267,6 +267,8 @@ void SPIRVToOCLBase::visitCastInst(CastInst &Cast) {
   CallInst *Call =
       addCallInst(M, CastBuiltInName, DstVecTy, Cast.getOperand(0), &Attributes,
                   &Cast, &Mangle, Cast.getName(), false);
+  if (isa<FPMathOperator>(&Cast))
+    Call->copyFastMathFlags(&Cast);
   Cast.replaceAllUsesWith(Call);
   Cast.eraseFromParent();
 }

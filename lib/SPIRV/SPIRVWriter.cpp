@@ -67,6 +67,7 @@
 #include "VectorComputeUtil.h"
 
 #include "llvm/ADT/DenseMap.h"
+#include "llvm/ADT/MapVector.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/StringSwitch.h"
 #include "llvm/Analysis/LoopAnalysisManager.h"
@@ -3367,12 +3368,17 @@ bool LLVMToSPIRVBase::transDecoration(Value *V, SPIRVValue *BV) {
   }
 
   if (auto *BVF = dyn_cast_or_null<FPMathOperator>(V)) {
+    // Both LLVM casts and OpenCL conversion builtins become OpFConvert.
+    if (BV->getOpCode() == OpFConvert && !BVF->hasAllowContract())
+      if (auto *I = dyn_cast<Instruction>(V); I && I->getParent())
+        joinFPContract(I->getFunction(), FPContract::DISABLED);
+
     auto Opcode = BVF->getOpcode();
     bool IsSPV16Op = (Opcode == Instruction::FNeg ||
                       Opcode == Instruction::FCmp || BV->isExtInst()) &&
                      BM->isAllowedToUseVersion(VersionNumber::SPIRV_1_6);
     bool IsFC2Op =
-        BV->getOpCode() == OpFunctionCall &&
+        (BV->getOpCode() == OpFunctionCall || BV->getOpCode() == OpFConvert) &&
         BM->isAllowedToUseExtension(ExtensionID::SPV_KHR_float_controls2);
     if (Opcode == Instruction::FAdd || Opcode == Instruction::FSub ||
         Opcode == Instruction::FMul || Opcode == Instruction::FDiv ||
@@ -3383,6 +3389,48 @@ bool LLVMToSPIRVBase::transDecoration(Value *V, SPIRVValue *BV) {
       bool AllowIntelFpFastMathMode =
           BM->isAllowedToUseExtension(ExtensionID::SPV_INTEL_fp_fast_math_mode);
       FastMathFlags FMF = BVF->getFastMathFlags();
+      if (AllowFloatControls2) {
+        // SPIR-V permits a decorated consumer to contract with an undecorated
+        // producer. For edges involving a conversion, require LLVM's rewrite
+        // permission on both instructions, including conversion builtins.
+        for (Value *Operand : BVF->operands()) {
+          auto *Producer = dyn_cast<FPMathOperator>(Operand);
+          if (!Producer)
+            continue;
+          // A dominating producer may occur later in block layout, before its
+          // SPIR-V opcode is available. Classify the LLVM instruction instead.
+          bool IsConversion = isa<FPTruncInst, FPExtInst>(Operand);
+          if (auto *Call = dyn_cast<CallInst>(Operand))
+            if (Function *F = Call->getCalledFunction()) {
+              IsConversion = getSPIRVFuncOC(F->getName()) == OpFConvert ||
+                             F->getIntrinsicID() ==
+                                 Intrinsic::experimental_constrained_fptrunc ||
+                             F->getIntrinsicID() ==
+                                 Intrinsic::experimental_constrained_fpext;
+              StringRef Name;
+              if (isInternalSPIRVBuiltin(F->getName(), Name) &&
+                  FPConvertToEncodingMap::find(Name))
+                IsConversion =
+                    FPConvertToEncodingMap::map(Name).ConvOpCode == OpFConvert;
+            }
+          if (BV->getOpCode() == OpFConvert || IsConversion) {
+            FMF.setAllowContract(FMF.allowContract() &&
+                                 Producer->hasAllowContract());
+            FMF.setAllowReassoc(FMF.allowReassoc() &&
+                                Producer->hasAllowReassoc());
+          }
+        }
+        if (BV->getOpCode() == OpFConvert &&
+            BM->getFPContractMode() == FPContractMode::Off) {
+          FMF.setAllowContract(false);
+          // LLVM reassoc maps to AllowTransform, which requires AllowContract.
+          FMF.setAllowReassoc(false);
+        }
+        // Removing a decoration must not restore permissive kernel defaults.
+        if (FMF != BVF->getFastMathFlags())
+          if (auto *I = dyn_cast<Instruction>(V); I && I->getParent())
+            joinFPContract(I->getFunction(), FPContract::DISABLED);
+      }
       SPIRVWord M{0};
       if (FMF.isFast()) {
         if (AllowFloatControls2) {
@@ -3481,7 +3529,9 @@ bool LLVMToSPIRVBase::transDecoration(Value *V, SPIRVValue *BV) {
         if (IsSPV16Op)
           BM->setMinSPIRVVersion(VersionNumber::SPIRV_1_6);
         if (IsFC2Op) {
-          BM->setMinSPIRVVersion(VersionNumber::SPIRV_1_6);
+          BM->setMinSPIRVVersion(BV->getOpCode() == OpFConvert
+                                     ? VersionNumber::SPIRV_1_2
+                                     : VersionNumber::SPIRV_1_6);
           BM->addCapability(CapabilityFloatControls2);
           BM->addExtension(ExtensionID::SPV_KHR_float_controls2);
         }
@@ -6867,6 +6917,20 @@ void LLVMToSPIRVBase::setExecutionModeFPFastMathDefault(
 bool LLVMToSPIRVBase::transExecutionMode() {
   transFPContract();
 
+  // Multiple restrictions can contribute defaults for the same kernel and type.
+  // Emit one mode, retaining only permissions allowed by every restriction.
+  MapVector<std::pair<SPIRVFunction *, SPIRVTypeFloat *>, SPIRVWord>
+      FPFastMathDefaults;
+  auto RecordFPFastMathDefault = [&](SPIRVFunction *BF,
+                                     ArrayRef<SPIRVTypeFloat *> Types,
+                                     SPIRVWord Flags) {
+    for (SPIRVTypeFloat *T : Types) {
+      auto [It, Inserted] = FPFastMathDefaults.try_emplace({BF, T}, Flags);
+      if (!Inserted)
+        It->second &= Flags;
+    }
+  };
+
   if (auto NMD = SPIRVMDWalker(*M).getNamedMD(kSPIRVMD::ExecutionMode)) {
     while (!NMD.atEnd()) {
       unsigned EMode = ~0U;
@@ -6912,8 +6976,8 @@ bool LLVMToSPIRVBase::transExecutionMode() {
           };
           llvm::sort(FloatSPIRVTypes, SortByFloatBitWidthAndEncoding);
 
-          setExecutionModeFPFastMathDefault(BF, FloatSPIRVTypes, 0);
-        } else {
+          RecordFPFastMathDefault(BF, FloatSPIRVTypes, 0);
+        } else if (!BF->getExecutionMode(spv::ExecutionModeContractionOff)) {
           BF->addExecutionMode(BM->add(new SPIRVExecutionMode(
               OpExecutionMode, BF, static_cast<ExecutionMode>(EMode))));
         }
@@ -7012,7 +7076,7 @@ bool LLVMToSPIRVBase::transExecutionMode() {
           N.get(BitWidth);
 
           SPIRVTypeFloat *FloatSPIRVType = BM->addFloatType(BitWidth);
-          setExecutionModeFPFastMathDefault(BF, FloatSPIRVType, 0);
+          RecordFPFastMathDefault(BF, FloatSPIRVType, 0);
           break;
         }
         [[fallthrough]];
@@ -7062,7 +7126,7 @@ bool LLVMToSPIRVBase::transExecutionMode() {
         assert(V && V->getType()->isFloatingPointTy());
         SPIRVTypeFloat *FloatSPIRVType =
             static_cast<SPIRVTypeFloat *>(transType(V->getType()));
-        setExecutionModeFPFastMathDefault(BF, FloatSPIRVType, FlagsLiteral);
+        RecordFPFastMathDefault(BF, FloatSPIRVType, FlagsLiteral);
         break;
       }
       default:
@@ -7070,6 +7134,9 @@ bool LLVMToSPIRVBase::transExecutionMode() {
       }
     }
   }
+
+  for (auto &[Key, Flags] : FPFastMathDefaults)
+    setExecutionModeFPFastMathDefault(Key.first, Key.second, Flags);
 
   // Per SPV_KHR_poison_freeze: "If PoisonFreezeKHR capability is declared, all
   // entry points must use the ArithmeticPoisonKHR execution mode".

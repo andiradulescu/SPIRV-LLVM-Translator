@@ -1317,12 +1317,68 @@ void SPIRVToLLVM::applyFPFastMathModeDecorations(const SPIRVValue *BV,
     return;
   }
 
+  // Conversion defaults are applied after the call graph is complete, since
+  // they depend on all entry points that can reach the containing function.
+  if (BV->getOpCode() == OpFConvert)
+    return;
+
   // Get the scalar type to handle vector operands. And get the first operand
   // type (instead of the result) due to fcmp instructions.
   Type *FloatType = Inst->getOperand(0)->getType()->getScalarType();
   auto Func2FMF = FuncToFastMathFlags.find({Inst->getFunction(), FloatType});
   if (Func2FMF != FuncToFastMathFlags.end()) {
     Inst->setFastMathFlags(Func2FMF->second);
+  }
+}
+
+void SPIRVToLLVM::applyFPFastMathDefaultsToConversions() {
+  if (FuncToFastMathFlags.empty())
+    return;
+
+  DenseMap<Function *, SmallVector<Function *, 2>> EntryPoints;
+  for (auto &[BF, Root] : FuncMap) {
+    // Exported and address-taken functions may also have unknown callers.
+    // Treat them as roots without defaults rather than assuming permissions.
+    if (!isKernel(BF) && Root->hasLocalLinkage() && !Root->hasAddressTaken())
+      continue;
+    SmallVector<Function *, 8> Worklist{Root};
+    SmallPtrSet<Function *, 16> Visited;
+    while (!Worklist.empty()) {
+      Function *F = Worklist.pop_back_val();
+      if (!Visited.insert(F).second)
+        continue;
+      EntryPoints[F].push_back(Root);
+      for (BasicBlock &BB : *F)
+        for (Instruction &I : BB)
+          if (auto *Call = dyn_cast<CallBase>(&I))
+            if (Function *Callee = Call->getCalledFunction())
+              Worklist.push_back(Callee);
+    }
+  }
+
+  for (auto &[BV, V] : ValueMap) {
+    if (BV->getOpCode() != OpFConvert)
+      continue;
+    auto *Inst = dyn_cast<Instruction>(V);
+    if (!Inst || !isa<FPMathOperator>(Inst) ||
+        BV->hasDecorate(DecorationFPFastMathMode))
+      continue;
+    auto Roots = EntryPoints.find(Inst->getFunction());
+    if (Roots == EntryPoints.end())
+      continue;
+    FastMathFlags Common = FastMathFlags::getFast();
+    for (Function *Root : Roots->second) {
+      FastMathFlags Defaults;
+      // Union the operand/result defaults before intersecting callers: two
+      // callers can grant the same permission through different types.
+      for (Type *T : {Inst->getOperand(0)->getType(), Inst->getType()}) {
+        auto It = FuncToFastMathFlags.find({Root, T->getScalarType()});
+        if (It != FuncToFastMathFlags.end())
+          Defaults |= It->second;
+      }
+      Common &= Defaults;
+    }
+    Inst->copyFastMathFlags(Common);
   }
 }
 
@@ -3296,6 +3352,9 @@ Value *SPIRVToLLVM::transValueWithoutDecoration(SPIRVValue *BV, Function *F,
       } else {
         Inst = transConvertInst(BV, F, BB);
       }
+      if (OC == OpFConvert)
+        if (auto *I = dyn_cast<Instruction>(Inst))
+          applyFPFastMathModeDecorations(BV, I);
       return mapValue(BV, Inst);
     }
     if (isIntelCvtOpCode(OC))
@@ -4331,6 +4390,8 @@ bool SPIRVToLLVM::translate() {
     transFunction(BM->getFunction(I), BM->getFunctionProgramAddrSpace());
     transUserSemantic(BM->getFunction(I));
   }
+
+  applyFPFastMathDefaultsToConversions();
 
   transGlobalAnnotations();
 

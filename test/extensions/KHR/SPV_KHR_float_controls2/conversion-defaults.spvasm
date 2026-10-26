@@ -1,0 +1,109 @@
+; REQUIRES: spirv-as
+; RUN: spirv-as %s -o %t.spv
+; RUN: spirv-val %t.spv
+; RUN: llvm-spirv -r --spirv-target-env=SPV-IR %t.spv -o %t.bc
+; RUN: llvm-dis %t.bc -o - | FileCheck %s --check-prefix=LLVM
+; RUN: llvm-spirv %t.bc --spirv-ext=+SPV_KHR_float_controls2 -o %t.back.spv
+; RUN: spirv-val %t.back.spv
+; RUN: llvm-spirv %t.bc --spirv-ext=+SPV_KHR_float_controls2 -spirv-text -o - | FileCheck %s --check-prefix=SPIRV
+
+; RUN: llvm-spirv -r --spirv-target-env=SPV-IR %t.back.spv -o %t.back.bc
+; RUN: llvm-dis %t.back.bc -o - | FileCheck %s --check-prefix=LLVM
+
+; RUN: llvm-spirv -r %t.spv -o %t.ocl.bc
+; RUN: llvm-dis %t.ocl.bc -o - | FileCheck %s --check-prefix=OCL
+; RUN: llvm-spirv %t.ocl.bc --spirv-ext=+SPV_KHR_float_controls2 -o %t.ocl.spv
+; RUN: spirv-val %t.ocl.spv
+; RUN: llvm-spirv -r --spirv-target-env=SPV-IR %t.ocl.spv -o %t.ocl.back.bc
+; RUN: llvm-dis %t.ocl.back.bc -o - | FileCheck %s --check-prefix=LLVM
+
+; OpenCL reverse translation lowers vector casts to conversion builtins.
+; OCL-LABEL: define spir_kernel void @both_types(
+; OCL: call nnan contract spir_func <2 x half> @_Z13convert_half2Dv2_f(
+; OCL: call nnan contract spir_func <2 x float> @_Z14convert_float2Dv2_Dh(
+
+; Defaults for both operand and result types apply to an undecorated conversion.
+; LLVM-LABEL: define spir_kernel void @both_types(
+; LLVM: fptrunc nnan contract <2 x float> {{.*}} to <2 x half>
+; LLVM: fpext nnan contract <2 x half> {{.*}} to <2 x float>
+; A missing type default contributes no flags, in either conversion direction.
+; LLVM-LABEL: define spir_kernel void @half_only(
+; LLVM: fptrunc contract float {{.*}} to half
+; LLVM: fpext contract half {{.*}} to float
+; An explicit decoration replaces defaults, including when it is zero.
+; LLVM-LABEL: define spir_kernel void @override(
+; LLVM: fptrunc contract float {{.*}} to half
+; LLVM: fpext half {{.*}} to float
+
+; Permissive defaults must survive SPIR-V -> LLVM -> SPIR-V translation.
+; SPIRV-DAG: EntryPoint 6 [[BOTH:[0-9]+]] "both_types"
+; SPIRV-DAG: EntryPoint 6 [[HALF_ONLY:[0-9]+]] "half_only"
+; SPIRV-DAG: TypeFloat [[HALF:[0-9]+]] 16
+; SPIRV-DAG: TypeFloat [[FLOAT:[0-9]+]] 32
+; SPIRV-DAG: Constant {{[0-9]+}} [[CONTRACT:[0-9]+]] 65536
+; SPIRV-DAG: Constant {{[0-9]+}} [[NOTNAN:[0-9]+]] 1
+; SPIRV-DAG: ExecutionModeId [[BOTH]] 6028 [[HALF]] [[CONTRACT]]
+; SPIRV-DAG: ExecutionModeId [[BOTH]] 6028 [[FLOAT]] [[NOTNAN]]
+; SPIRV-DAG: ExecutionModeId [[HALF_ONLY]] 6028 [[HALF]] [[CONTRACT]]
+
+OpCapability Addresses
+OpCapability Kernel
+OpCapability Float16Buffer
+OpCapability FloatControls2
+OpExtension "SPV_KHR_float_controls2"
+OpMemoryModel Physical64 OpenCL
+OpEntryPoint Kernel %both_types "both_types"
+OpEntryPoint Kernel %half_only "half_only"
+OpEntryPoint Kernel %override "override"
+OpExecutionModeId %both_types FPFastMathDefault %half %contract
+OpExecutionModeId %both_types FPFastMathDefault %float %nnan
+OpExecutionModeId %half_only FPFastMathDefault %half %contract
+OpExecutionModeId %override FPFastMathDefault %half %contract
+OpExecutionModeId %override FPFastMathDefault %float %nnan
+OpName %both_types "both_types"
+OpName %half_only "half_only"
+OpName %override "override"
+OpDecorate %override_h FPFastMathMode AllowContract
+OpDecorate %override_f FPFastMathMode None
+%void = OpTypeVoid
+%uint = OpTypeInt 32 0
+%half = OpTypeFloat 16
+%float = OpTypeFloat 32
+%vhalf = OpTypeVector %half 2
+%vfloat = OpTypeVector %float 2
+%contract = OpConstant %uint 65536
+%nnan = OpConstant %uint 1
+%ptr = OpTypePointer CrossWorkgroup %float
+%vptr = OpTypePointer CrossWorkgroup %vfloat
+%fn = OpTypeFunction %void %float %ptr
+%vfn = OpTypeFunction %void %vfloat %vptr
+%both_types = OpFunction %void None %vfn
+%x = OpFunctionParameter %vfloat
+%out = OpFunctionParameter %vptr
+%entry = OpLabel
+%h = OpFConvert %vhalf %x
+%f = OpFConvert %vfloat %h
+OpStore %out %f
+OpReturn
+OpFunctionEnd
+%half_only = OpFunction %void None %fn
+%x2 = OpFunctionParameter %float
+%out2 = OpFunctionParameter %ptr
+%entry2 = OpLabel
+%h2 = OpFConvert %half %x2
+%f2 = OpFConvert %float %h2
+OpStore %out2 %f2
+OpReturn
+OpFunctionEnd
+%override = OpFunction %void None %fn
+%x3 = OpFunctionParameter %float
+%out3 = OpFunctionParameter %ptr
+%entry3 = OpLabel
+%override_h = OpFConvert %half %x3
+%override_f = OpFConvert %float %override_h
+; A no-op bitcast can share the conversion's LLVM value. It must not replace
+; the explicit zero decoration with inherited defaults.
+%alias = OpBitcast %float %override_f
+OpStore %out3 %alias
+OpReturn
+OpFunctionEnd
